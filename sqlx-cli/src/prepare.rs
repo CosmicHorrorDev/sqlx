@@ -12,6 +12,8 @@ use std::str::FromStr;
 use std::time::SystemTime;
 use std::{env, fs};
 
+use crate::config::{Config, MergedStrategy, TouchStrategy};
+
 type QueryData = BTreeMap<String, serde_json::Value>;
 type JsonObject = serde_json::Map<String, serde_json::Value>;
 
@@ -80,6 +82,42 @@ pub fn check(url: &str, merge: bool, cargo_args: Vec<String>) -> anyhow::Result<
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct Metadata {
+    packages: Vec<Package>,
+    target_directory: PathBuf,
+    workspace_root: PathBuf,
+    workspace_members: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct Package {
+    id: String,
+    targets: Vec<Target>,
+}
+
+#[derive(Deserialize)]
+struct Target {
+    src_path: PathBuf,
+}
+
+impl Metadata {
+    fn get_workspace_source_file_paths(&self) -> Vec<PathBuf> {
+        // Extract out just the packages that belong to the workspace
+        let workspace_packages: Vec<_> = self
+            .packages
+            .iter()
+            .filter(|package| self.workspace_members.contains(&package.id))
+            .collect();
+
+        // Flatten out each packages listing of `src_path`s
+        workspace_packages
+            .into_iter()
+            .flat_map(|package| package.targets.iter().map(|target| target.src_path.clone()))
+            .collect()
+    }
+}
+
 fn run_prepare_step(merge: bool, cargo_args: Vec<String>) -> anyhow::Result<QueryData> {
     anyhow::ensure!(
         Path::new("Cargo.toml").exists(),
@@ -96,31 +134,54 @@ hint: This command only works in the manifest directory of a Cargo package."#
         .output()
         .context("Could not fetch metadata")?;
 
-    #[derive(Deserialize)]
-    struct Metadata {
-        target_directory: PathBuf,
-    }
-
     let metadata: Metadata =
         serde_json::from_slice(&output.stdout).context("Invalid `cargo metadata` output")?;
+
+    let config_path = &metadata.workspace_root.join("sqlx.toml");
+    let config = if config_path.is_file() {
+        Config::from_path(config_path).context("Error reading sqlx.toml file")?
+    } else {
+        Config::default()
+    };
 
     // try removing the target/sqlx directory before running, as stale files
     // have repeatedly caused issues in the past.
     let _ = remove_dir_all(metadata.target_directory.join("sqlx"));
 
     let check_status = if merge {
-        let check_status = Command::new(&cargo).arg("clean").status()?;
+        // Setup things based on the config
+        match config.merged_strategy {
+            MergedStrategy::Clean => {
+                let clean_status = Command::new(&cargo).arg("clean").status()?;
+                if !clean_status.success() {
+                    bail!("`cargo clean` failed with status: {}", clean_status);
+                }
+            }
+            MergedStrategy::Touch(TouchStrategy { packages_to_clean }) => {
+                // Touch every package in the workspace
+                for source_path in metadata.get_workspace_source_file_paths() {
+                    let now = filetime::FileTime::now();
+                    filetime::set_file_times(&source_path, now, now)
+                        .with_context(|| format!("Failed to update mtime for {:?}", source_path))?;
+                }
 
-        if !check_status.success() {
-            bail!("`cargo clean` failed with status: {}", check_status);
+                // Clean all the packages listed in `packages_to_clean`
+                for package_name in &packages_to_clean {
+                    let clean_status = Command::new(&cargo)
+                        .args(&["clean", "-p", package_name])
+                        .status()?;
+                    if !clean_status.success() {
+                        bail!(
+                            "`cargo clean -p {}` failed with status: {}",
+                            package_name,
+                            clean_status
+                        );
+                    }
+                }
+            }
         }
 
-        let mut rustflags = env::var("RUSTFLAGS").unwrap_or_default();
-        rustflags.push_str(&format!(
-            " --cfg __sqlx_recompile_trigger=\"{}\"",
-            SystemTime::UNIX_EPOCH.elapsed()?.as_millis()
-        ));
-
+        let rustflags = env::var("RUSTFLAGS").unwrap_or_default();
         Command::new(&cargo)
             .arg("check")
             .args(cargo_args)
@@ -254,5 +315,34 @@ mod tests {
         assert_eq!(data.len(), 2);
         assert_eq!(data.get("a"), Some(&json!({"key1": "value1"})));
         assert_eq!(data.get("z"), Some(&json!({"key2": "value2"})));
+    }
+
+    #[test]
+    fn source_files_from_metadata_deserialization() -> anyhow::Result<()> {
+        let sample_metadata_file_path = PathBuf::new()
+            .join("tests")
+            .join("assets")
+            .join("sample_metadata.json");
+        let contents = std::fs::read_to_string(&sample_metadata_file_path)?;
+        let metadata: Metadata = serde_json::from_str(&contents)?;
+
+        let mut source_paths = metadata.get_workspace_source_file_paths();
+        source_paths.sort();
+
+        const PATH_BASE: &str = "/home/user/sample_workspace/";
+        let mut expected: Vec<_> = [
+            "bar/src/lib.rs",
+            "bar/tests/test_file.rs",
+            "foo/src/main.rs",
+            "foo/build.rs",
+        ]
+        .iter()
+        .map(|rel_path| PathBuf::from(format!("{}{}", PATH_BASE, rel_path)))
+        .collect();
+        expected.sort();
+
+        assert_eq!(source_paths, expected);
+
+        Ok(())
     }
 }

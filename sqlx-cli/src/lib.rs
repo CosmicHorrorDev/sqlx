@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use crate::opt::{Command, DatabaseCommand, MigrateCommand};
 
+mod config;
 mod database;
 // mod migration;
 // mod migrator;
